@@ -2,11 +2,12 @@
 email_pipeline_example.py
 
 Reference implementation of the email pipeline.
-Copy and split into email_setup.py / sender.py for production use.
+Copy and split into email_setup.py / sender.py / log_utils.py for production use.
 
 Sections:
   1. Configuration  (email_setup.py)
   2. Sender         (sender.py)
+  3. Logging        (log_utils.py)
 """
 
 # ============================================================
@@ -16,9 +17,10 @@ from pathlib import Path
 
 DESKTOP_PATH  = Path.home() / 'Desktop'
 DOWNLOAD_BASE = DESKTOP_PATH / 'YourFolder' / 'SubFolder' / 'Data'
+LOG_BASE      = DESKTOP_PATH / 'YourFolder' / 'SubFolder' / 'Logs'
 MAX_DATA_FOLDERS = 5
 
-# .env file path — holds TMS/SMTP credentials
+# .env file path, holds TMS/SMTP credentials
 ENV_PATH = Path(r'\\your-server\path\to\env-folder\.env')
 
 # TMS credentials (.env keys)
@@ -35,14 +37,22 @@ NOTIFICATION_FROM = 'sender@example.com'
 
 ATTACHMENT_MIME = ("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# Report email
-EMAIL_SUBJECT = 'Report Name_{}_{}'  # .format(region, date)
+# Report email, Provider A
+EMAIL_SUBJECT = 'Provider A_Report Name_{}_{}'  # .format(region, date)
 EMAIL_TO      = ['recipient@example.com']
-EMAIL_CC      = ['cc@example.com']
+# CC is region specific, defined per-run in a RUNS dict (see main_example.py)
 EMAIL_BCC     = ['bcc@example.com']
 
-# Failure alert email
-EMAIL_SUBJECT_FAILURE = 'FAILED - Report Name_{}_{}'  # .format(region, date)
+# Report email, Provider B
+EMAIL_SUBJECT_PROVIDER_B = 'Provider B_Report Name_{}_{}'  # .format(region, date)
+EMAIL_TO_PROVIDER_B      = ['partner-recipient@example.com']
+# CC is region specific, same per-run cc list as Provider A
+
+# Failure / no-data alert email
+EMAIL_SUBJECT_FAILURE = 'FAILED - Provider A_Report Name_{}_{}'  # .format(region, date)
+EMAIL_SUBJECT_NO_DATA = 'NO DATA - Provider A_Report Name_{}_{}'  # .format(region, date)
+EMAIL_SUBJECT_FAILURE_PROVIDER_B = 'FAILED - Provider B_Report Name_{}_{}'  # .format(region, date)
+EMAIL_SUBJECT_NO_DATA_PROVIDER_B = 'NO DATA - Provider B_Report Name_{}_{}'  # .format(region, date)
 EMAIL_TO_FAILURE      = ['oncall@example.com']
 EMAIL_CC_FAILURE      = []
 
@@ -128,3 +138,73 @@ def load_sender() -> Optional[EmailSender]:
         logger.error("SMTP credentials missing")
         return None
     return EmailSender(user, pw)
+
+
+# ============================================================
+# 3. LOGGING  (log_utils.py)
+# ============================================================
+import logging.handlers
+from datetime import date
+
+
+def setup_logger(log_dir: Path, name: str = 'main', max_logs: int = 10):
+    """Buffer all log records in memory and keep the last N daily log files on disk."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"{name}_{date.today().strftime('%Y%m%d')}.log"
+
+    logs = sorted(log_dir.glob(f"{name}_*.log"))
+    for old in logs[:-max_logs]:
+        old.unlink()
+
+    fmt = logging.Formatter('%(asctime)s | %(levelname)-7s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+    memory_handler = logging.handlers.MemoryHandler(capacity=10000, flushLevel=logging.CRITICAL)
+    memory_handler.setFormatter(fmt)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(memory_handler)
+    root.addHandler(console_handler)
+
+    return logging.getLogger(name), log_file
+
+
+def _flush_to_file(log_file: Path) -> None:
+    """Write the buffered log records to disk. Call this once, right before exit."""
+    root = logging.getLogger()
+    memory_handler = next((h for h in root.handlers if isinstance(h, logging.handlers.MemoryHandler)), None)
+    if memory_handler is None:
+        return
+    fmt = logging.Formatter('%(asctime)s | %(levelname)-7s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setFormatter(fmt)
+    memory_handler.setTarget(file_handler)
+    memory_handler.flush()
+    file_handler.close()
+    memory_handler.setTarget(None)
+
+
+def get_log_snippet(log_file: Path) -> str:
+    """Extract only WARNING/ERROR lines from the day's log file for the alert email body."""
+    if not log_file.exists():
+        return '(log file not found)'
+    lines = [l.rstrip() for l in log_file.read_text(encoding='utf-8').splitlines()
+             if '| ERROR   |' in l or '| WARNING |' in l]
+    return '<br>'.join(lines) if lines else '(no warning/error lines found)'
+
+
+def notify_failure(notifier, subject: str, to: list, cc: list, log_file: Path):
+    """Flush the buffered log to disk and email the WARNING/ERROR lines as a failure alert."""
+    _flush_to_file(log_file)
+    snippet = get_log_snippet(log_file)
+    body = (
+        '<BODY style="font-size:11pt;font-family:Calibri">'
+        'An error occurred. Please see the log below.<br><br>'
+        '<b>Log (WARNING / ERROR):</b><br>'
+        f'<pre style="font-size:10pt;font-family:Consolas">{snippet}</pre>'
+        '</BODY>'
+    )
+    notifier.send(subject=subject, body=body, to=to, cc=cc)
