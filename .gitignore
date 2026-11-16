@@ -9,3 +9,19 @@ gen
 
 __pycache__/
 *.pyc
+
+# Never upload (data, binaries, env, logs)
+*.xlsx
+*.xls
+*.csv
+*.exe
+*.log
+.env
+__pycache__/
+*.pyc
+venv/
+.venv/
+myenv/
+logs/
+download/
+~$*
